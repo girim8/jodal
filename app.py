@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
-# app.py Part 1/2 (위에 이 파일 내용 먼저 붙여넣고, 바로 Part 2/2를 이어서 붙여넣어 하나의 app.py로 만드세요)
-# Streamlit Cloud 최적화 통합본 – 헬퍼/유틸/사이드바까지
+# app.py Part 1/2 — Streamlit Cloud 최적화 통합본
+# - st.secrets 우선, 없으면 세션키 사용
+# - LibreOffice(soffice) 있으면 HWP/HWPX/DOCX/PPTX/XLSX → PDF 자동 변환 후 분석
+# - soffice 없거나 구형 HWP(OLE)일 때: HWPX는 XML 직해석→간이 PDF, HWP(OLE)는 PrvText 추출→간이 PDF 폴백
+# - 첨부링크 매트릭스 Excel 내보낼 때 HTML 제거(텍스트만)
+# - **그룹형(Compact) 카드 UI 복구: render_attachment_cards_html()**
+# - 차트/필터/챗봇/보고서 PDF 변환 포함
 
 import streamlit as st
 st.set_page_config(
@@ -130,7 +135,7 @@ def _safe_tmp_write(data: bytes, suffix: str) -> str:
 
 
 def convert_with_soffice(input_bytes: bytes, in_suffix: str):
-    """LibreOffice로 PDF 변환. (bytes, debug) 반환"""
+    """LibreOffice로 PDF 변환. (bytes, debug) 반환 — 디버그 로그 강화"""
     soffice = _which("soffice") or _which("libreoffice")
     if not soffice:
         return None, "soffice 미설치"
@@ -138,17 +143,20 @@ def convert_with_soffice(input_bytes: bytes, in_suffix: str):
     out_dir = os.path.dirname(in_path)
     try:
         cmd = [soffice, "--headless", "--nologo", "--nofirststartwizard",
-               "--convert-to", "pdf", "--outdir", out_dir, in_path]
+               "--convert-to", "pdf:writer_pdf_Export", "--outdir", out_dir, in_path]
         cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+        stdout_s = cp.stdout.decode(errors="ignore")[:400]
+        stderr_s = cp.stderr.decode(errors="ignore")[:400]
         if cp.returncode != 0:
-            return None, f"soffice 변환 실패: {cp.stderr.decode(errors='ignore')[:400]}"
+            return None, f"soffice 변환 실패[rtn={cp.returncode}] stdout={stdout_s} stderr={stderr_s}"
         pdf_path = os.path.splitext(in_path)[0] + ".pdf"
         if not os.path.exists(pdf_path):
-            for fn in os.listdir(out_dir):
-                if fn.lower().endswith(".pdf"):
-                    pdf_path = os.path.join(out_dir, fn); break
+            # 드물게 다른 파일명으로 떨어지는 경우 대비
+            candidates = [fn for fn in os.listdir(out_dir) if fn.lower().endswith(".pdf")]
+            if candidates:
+                pdf_path = os.path.join(out_dir, candidates[0])
         if not os.path.exists(pdf_path):
-            return None, "PDF 결과 파일을 찾지 못함"
+            return None, f"PDF 결과 파일을 찾지 못함 stdout={stdout_s} stderr={stderr_s}"
         with open(pdf_path, "rb") as f:
             return f.read(), "OK[soffice]"
     except subprocess.TimeoutExpired:
@@ -244,6 +252,52 @@ def text_to_pdf_bytes_korean(text: str, title: str = ""):
         except Exception as e2:
             return None, f"PDF 생성 실패: {e2}"
 
+# ====== HWP(OLE) 폴백: 미리보기 텍스트 → 간이 PDF ======
+
+def extract_text_from_hwp_ole_preview(file_bytes: bytes) -> str:
+    """HWP(OLE)의 'PrvText' 스트림에서 미리보기 텍스트 추출 (가능할 때만)."""
+    try:
+        import olefile
+    except Exception:
+        return ""
+    try:
+        bio = BytesIO(file_bytes)
+        if not olefile.isOleFile(bio):
+            return ""
+        bio.seek(0)
+        with olefile.OleFileIO(bio) as ole:
+            candidates = [
+                "PrvText",
+                "PrvText\\PrvText",
+                "Preview\\PrvText",
+                "PrvImage",
+            ]
+            for cand in candidates:
+                if ole.exists(cand):
+                    with ole.openstream(cand) as s:
+                        data = s.read()
+                        for enc in ("utf-16le", "utf-8", "cp949"):
+                            try:
+                                txt = data.decode(enc)
+                                if txt.strip():
+                                    return txt.strip()
+                            except Exception:
+                                continue
+        return ""
+    except Exception:
+        return ""
+
+
+def hwpoletxt_to_pdf_bytes(file_bytes: bytes, filename: str):
+    """HWP(OLE)에서 미리보기 텍스트 발견 시 간이 PDF로 변환."""
+    txt = extract_text_from_hwp_ole_preview(file_bytes)
+    if not txt:
+        return None, "HWP(OLE) 미리보기 텍스트 없음"
+    pdf_bytes, dbg = text_to_pdf_bytes_korean(txt, title=os.path.basename(filename))
+    if pdf_bytes:
+        return pdf_bytes, f"OK[HWP-OLE PrvText → {dbg}]"
+    return None, f"HWP-OLE 텍스트는 찾았으나 PDF 생성 실패: {dbg}"
+
 
 def convert_any_to_pdf(file_bytes: bytes, filename: str):
     ext = os.path.splitext(filename)[1].lower()
@@ -254,13 +308,19 @@ def convert_any_to_pdf(file_bytes: bytes, filename: str):
         txt = extract_text_from_hwpx_bytes(file_bytes)
         pdf2, dbg2 = text_to_pdf_bytes_korean(txt, title=os.path.basename(filename))
         return pdf2, f"{dbg} → {dbg2}"
+    # 구형 .hwp(OLE) 폴백
+    if ext == ".hwp":
+        pdf3, dbg3 = hwpoletxt_to_pdf_bytes(file_bytes, filename)
+        if pdf3:
+            return pdf3, f"{dbg} → {dbg3}"
     return None, dbg
 
 # =====================================
 # 파일 텍스트/소스 처리 (자동 변환 포함)
 # =====================================
 
-DOC_EXTS = {".doc", ".docx", ".hwp", ".hwpx", ".xls", ".xlsx", ".pdf", ".txt"}
+DOC_EXTS = {".doc", ".docx", ".hwp", ".hwpx", ".xls", ".xlsx", ".pdf", ".txt", ".ppt", ".pptx", ".csv", ".md", ".log"}
+
 
 def _is_url(val: str) -> bool:
     s = str(val).strip()
@@ -307,7 +367,7 @@ def extract_text_combo(uploaded_files):
     return "\n".join(combined_texts).strip(), convert_logs, generated_pdfs
 
 # =====================================
-# 첨부링크 매트릭스 (입찰공고명 UNIQUE) — HTML 제거 저장 + 카드형 렌더러
+# 첨부링크 매트릭스 — HTML 제거 저장 + 카드형 렌더러
 # =====================================
 
 def _strip_html(s: str) -> str:
@@ -336,6 +396,7 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
             name_val = row.get(name_col, None)
             if pd.isna(url_val): continue
             raw = str(url_val).strip()
+            # URL 파싱
             if _is_url(raw):
                 urls = [raw]
             else:
@@ -408,9 +469,8 @@ def render_attachment_table_html(df_links: pd.DataFrame, title_col: str,
     return "\n".join(html)
 
 
-
 def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
-    """Compact 카드형 UI"""
+    """**Compact 카드형** UI"""
     cat_cols = ["본공고링크","제안요청서","공고서","과업지시서","규격서","기타"]
     present_cols = [c for c in cat_cols if c in df_links.columns]
     if title_col not in df_links.columns:
@@ -468,6 +528,7 @@ VENDOR_COLOR_MAP = {
 }
 OTHER_SEQ = ["#2E8B57","#6B8E23","#556B2F","#8B4513","#A0522D","#CD853F","#228B22","#006400"]
 
+
 def normalize_vendor(name: str) -> str:
     s = str(name) if pd.notna(name) else ""
     if "엘지유플러스" in s or "LG유플러스" in s or "LG U" in s.upper():
@@ -481,7 +542,7 @@ def normalize_vendor(name: str) -> str:
     return s or "기타"
 
 # =====================================
-# 로그인 게이트 & 사이드바 (여기까지 Part 1)
+# 로그인 게이트 & 사이드바 (1/2 끝)
 # =====================================
 
 def login_gate():
@@ -537,6 +598,10 @@ if _gpt_enabled:
 else:
     st.sidebar.warning(f"GPT 비활성 — {_gpt_status}")
 
+# 진단: soffice 경로 표시
+import shutil as _sh
+st.sidebar.caption(f"soffice: {_sh.which('soffice')}")
+
 gpt_extra_req = st.sidebar.text_area(
     "🤖 GPT 추가 요구사항(선택)", height=120,
     placeholder="예) 'MACsec, SRv6 강조', '세부 일정 표 추가' 등",
@@ -549,9 +614,8 @@ if not AUThed:
     st.stop()
 
 # ===== Part 2에서 이어집니다 =====
-
 # -*- coding: utf-8 -*-
-# app.py Part 2/2 (이 파일 내용을 Part 1/2 바로 아래에 이어서 붙여넣으세요)
+# app.py Part 2/2 — 본문: 데이터 로드/필터/차트/보고서/챗봇
 
 from io import BytesIO
 from datetime import datetime
@@ -585,10 +649,10 @@ if "대표업체" in df.columns:
 else:
     selected_companies = []
 
-demand_col_sidebar = "수요기관명" if "수요기관명" in df.columns else ("수요기관" if "수요기관" in df.columns else None)
-if demand_col_sidebar:
-    org_list = sorted(df[demand_col_sidebar].dropna().unique())
-    selected_orgs = st.sidebar.multiselect(f"{demand_col_sidebar} 필터 (복수 가능)", org_list)
+_demand_col_sidebar = "수요기관명" if "수요기관명" in df.columns else ("수요기관" if "수요기관" in df.columns else None)
+if _demand_col_sidebar:
+    org_list = sorted(df[_demand_col_sidebar].dropna().unique())
+    selected_orgs = st.sidebar.multiselect(f"{_demand_col_sidebar} 필터 (복수 가능)", org_list)
 else:
     selected_orgs = []
 
@@ -616,15 +680,16 @@ if only_winner and "낙찰자선정여부" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["낙찰자선정여부"] == "Y"]
 if selected_companies and "대표업체" in df_filtered.columns:
     df_filtered = df_filtered[df_filtered["대표업체"].isin(selected_companies)]
-if selected_orgs and demand_col_sidebar:
-    df_filtered = df_filtered[df_filtered[demand_col_sidebar].isin(selected_orgs)]
+if selected_orgs and _demand_col_sidebar:
+    df_filtered = df_filtered[df_filtered[_demand_col_sidebar].isin(selected_orgs)]
 
-# 원본 보관 (고객 분석용)
+# 원본 보관
 df_original = df.copy()
 
 # ===== 기본 분석(차트) =====
 
 def render_basic_analysis_charts(base_df: pd.DataFrame):
+    from math import isfinite
     def pick_unit(max_val: float):
         if max_val >= 1_0000_0000_0000: return ("조원", 1_0000_0000_0000)
         elif max_val >= 100_000_000: return ("억원", 100_000_000)
@@ -652,6 +717,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             dwin[col] = pd.to_numeric(dwin[col], errors="coerce")
 
     if "대표업체" in dwin.columns:
+        # normalize_vendor는 Part1에서 정의됨
         dwin["대표업체_표시"] = dwin["대표업체"].map(normalize_vendor)
     else:
         dwin["대표업체_표시"] = "기타"
@@ -813,6 +879,7 @@ def _safe_filename(name: str) -> str:
         name += ".pdf"
     return name[:160]
 
+# ReportLab/Pillow 기반 PDF 생성기 (Part1의 text_to_pdf_bytes_korean 사용)
 
 def markdown_to_pdf_korean(md_text: str, title: str|None=None):
     pdf_bytes, dbg = text_to_pdf_bytes_korean(md_text, title or "")
@@ -1078,7 +1145,7 @@ elif menu == "내고객 분석하기":
                     if m["role"]=="user":
                         st.chat_message("user").markdown(m["content"])
                     else:
-                        st.chat_message("assistant").markdown(m["content"]) 
+                        st.chat_message("assistant").markdown(m["content"])
         else:
             st.info("고객사명을 입력하면 자동 필터링됩니다.")
     else:
@@ -1086,17 +1153,19 @@ elif menu == "내고객 분석하기":
 
 # ===== 배포 체크리스트 =====
 # requirements.txt:
-#   openai
-#   streamlit
-#   PyPDF2
-#   reportlab
-#   Pillow
-#   openpyxl
-#   pandas
-#   numpy
-#   plotly
-# apt.txt (Streamlit Cloud):
+#   streamlit>=1.38
+#   pandas>=2.2
+#   openpyxl>=3.1
+#   numpy>=1.26
+#   plotly>=5.22
+#   PyPDF2>=3.0
+#   python-docx>=1.1
+#   reportlab>=4.2
+#   Pillow>=10.4
+#   openai>=1.50
+#   olefile>=0.47
+# packages.txt (레포 루트):
 #   libreoffice
+#   libreoffice-writer
 #   fonts-nanum
 #   fonts-noto-cjk
-
