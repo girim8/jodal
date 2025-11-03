@@ -2,3 +2,4 @@ libreoffice
 libreoffice-writer
 fonts-nanum
 fonts-noto-cjk
+default-jre
