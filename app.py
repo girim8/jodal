@@ -5,6 +5,7 @@
 # - LibreOffice(soffice) 있으면 HWP/HWPX/DOCX 등 → PDF 자동 변환 후 분석
 # - soffice 없을 때: HWPX는 XML 텍스트 추출 + 간이 PDF, HWP(OLE)는 변환 불가 로그 안내
 # - 첨부링크 매트릭스 Excel 내보내기 시 HTML 제거(텍스트만)
+# - **그룹형(Compact) 카드 UI 복구: render_attachment_cards_html() 재도입**
 # - 차트/필터/챗봇/보고서 PDF 변환 포함
 
 import streamlit as st
@@ -312,7 +313,7 @@ def extract_text_combo(uploaded_files):
     return "\n".join(combined_texts).strip(), convert_logs, generated_pdfs
 
 # =====================================
-# 첨부링크 매트릭스 (입찰공고명 UNIQUE) — HTML 제거 저장 지원
+# 첨부링크 매트릭스 (입찰공고명 UNIQUE) — HTML 제거 저장 + **카드형(Compact) 렌더러 복구**
 # =====================================
 
 def _strip_html(s: str) -> str:
@@ -413,6 +414,55 @@ def render_attachment_table_html(df_links: pd.DataFrame, title_col: str,
     html.append("</tbody></table>")
     return "\n".join(html)
 
+
+def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
+    """이전과 동일한 **Compact 카드형** UI 복구 버전"""
+    cat_cols = ["본공고링크","제안요청서","공고서","과업지시서","규격서","기타"]
+    present_cols = [c for c in cat_cols if c in df_links.columns]
+    if title_col not in df_links.columns:
+        return "<p>표시할 데이터가 없습니다.</p>"
+    css = """
+<style>
+.attch-wrap { display:flex; flex-direction:column; gap:14px; background:#eef6ff; padding:8px; border-radius:12px; }
+.attch-card { border:1px solid #cfe1ff; border-radius:12px; padding:12px 14px; background:#f4f9ff; box-shadow:0 1px 3px rgba(13,110,253,0.05); }
+.attch-title { font-weight:700; margin-bottom:8px; font-size:13px; line-height:1.4; word-break:break-word; color:#0b2e5b; }
+.attch-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:10px; }
+.attch-box { border:1px solid #cfe1ff; border-radius:10px; overflow:hidden; background:#ffffff; }
+.attch-box-header { background:#0d6efd; color:#fff; font-weight:700; font-size:11px; padding:6px 8px; display:flex; align-items:center; justify-content:space-between; }
+.badge { background:rgba(255,255,255,0.2); color:#fff; padding:0 6px; border-radius:999px; font-size:10px; }
+.attch-box-body { padding:8px; font-size:12px; line-height:1.45; word-break:break-word; color:#0b2447; }
+.attch-box-body a { color:#0b5ed7; text-decoration:none; }
+.attch-box-body a:hover { text-decoration:underline; }
+.attch-box-body details summary { cursor:pointer; font-weight:600; list-style:none; outline:none; color:#0b2447; }
+.attch-box-body details summary::-webkit-details-marker { display:none; }
+.attch-box-body details summary:after { content:"▼"; font-size:10px; margin-left:6px; color:#0b2447; }
+</style>
+"""
+    html = [css, '<div class="attch-wrap">']
+    for _, r in df_links.iterrows():
+        title = str(r.get(title_col, "") or "")
+        html.append('<div class="attch-card">')
+        html.append(f'<div class="attch-title">{title}</div>')
+        html.append('<div class="attch-grid">')
+        for col in present_cols:
+            raw = str(r.get(col, "") or "").strip()
+            if not raw: continue
+            parts = [p.strip() for p in raw.split("|") if p.strip()]
+            count = len(parts)
+            if count <= 3:
+                body_html = raw
+            else:
+                head = " | ".join(parts[:3])
+                tail = " | ".join(parts[3:])
+                body_html = head + f'<details style="margin-top:6px;"><summary>더보기 ({count-3})</summary>{tail}</details>'
+            html.append('<div class="attch-box">')
+            html.append(f'<div class="attch-box-header">{col} <span class="badge">{count}</span></div>')
+            html.append(f'<div class="attch-box-body">{body_html}</div>')
+            html.append('</div>')
+        html.append('</div></div>')
+    html.append("</div>")
+    return "\n".join(html)
+
 # =====================================
 # 벤더 정규화 & 색상
 # =====================================
@@ -508,7 +558,19 @@ if not AUThed:
 # (2/2) 본문 - 데이터 로드/필터/차트/보고서/챗봇
 # =====================================
 
+from io import BytesIO
+from datetime import datetime
+import pandas as pd
+import numpy as np
+import streamlit as st
+import plotly.express as px
+import re
+
 # ===== 업로드 엑셀 로드 =====
+if not 'uploaded_file' in globals():
+    # 안전장치: (1/2)에서 정의된 변수에 의존
+    uploaded_file = None
+
 if not uploaded_file:
     st.title("📊 조달입찰 분석 시스템")
     st.info("좌측에서 'filtered' 시트를 포함한 엑셀 파일을 업로드하세요.")
@@ -594,6 +656,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         if col in dwin.columns:
             dwin[col] = pd.to_numeric(dwin[col], errors="coerce")
 
+    # normalize_vendor, 색상 맵은 (1/2)에서 정의됨
     if "대표업체" in dwin.columns:
         dwin["대표업체_표시"] = dwin["대표업체"].map(normalize_vendor)
     else:
@@ -756,6 +819,7 @@ def _safe_filename(name: str) -> str:
         name += ".pdf"
     return name[:160]
 
+# (1/2)에서 정의된 ReportLab/Pillow 기반 함수 사용
 
 def markdown_to_pdf_korean(md_text: str, title: str|None=None):
     pdf_bytes, dbg = text_to_pdf_bytes_korean(md_text, title or "")
@@ -853,13 +917,13 @@ elif menu == "내고객 분석하기":
                         use_compact = st.toggle("🔀 그룹형(Compact) 보기로 전환", value=True,
                                                 help="가로폭을 줄이고 읽기 좋게 카드형으로 표시")
                         if use_compact:
-                            # 간단 카드형: 링크 직접 클릭용 (표 버전은 생략)
-                            st.caption("카드형은 시각화 전용입니다. Excel 저장 시 HTML 제거됩니다.")
-                            # 간단한 텍스트 카운트만 표시
-                            st.write(attach_df.head(3))
+                            # ✅ 복구된 Compact 카드형 호출
+                            html = render_attachment_cards_html(attach_df, title_col)
+                            st.markdown(html, unsafe_allow_html=True)
                         else:
                             html = render_attachment_table_html(attach_df, title_col, 360, 440, 280)
                             st.markdown(html, unsafe_allow_html=True)
+
                         # === Excel 저장은 HTML 제거 버전 ===
                         attach_df_text = attach_df.copy().applymap(_strip_html)
                         xbuf = BytesIO()
