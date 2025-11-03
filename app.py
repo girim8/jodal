@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
-# app_part1.py — 공통 유틸/변환/폰트/PDF/HWP 파이프라인
+# =============================================================
+# app_part1.py — 공통 유틸/변환/폰트/PDF/HWP 파이프라인 (hwp5txt 우선 → unoconv 폴백)
+# =============================================================
 
 import os
 import re
@@ -119,6 +121,8 @@ def _resolve_korean_font_candidates():
             uniq.append((name, path, ext))
     return uniq
 
+# ---- ReportLab 경로 (TTF/OTF만)
+
 def _pdf_via_reportlab_from_md(md_text: str, title: str, font_name: str, font_path: str, ext: str):
     if ext not in ("ttf", "otf"):
         return None, "ReportLab 경로는 TTF/OTF만 지원 (TTC 감지)"
@@ -149,14 +153,13 @@ def _pdf_via_reportlab_from_md(md_text: str, title: str, font_name: str, font_pa
     def esc(s: str) -> str:
         return (s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace("\t","    "))
 
-    lines = md_text.replace("\r\n","\n").split("\n")
+    lines = (md_text or "").replace("\r\n","\n").split("\n")
     flow = []
     if title:
         flow.append(Paragraph(esc(title), h2)); flow.append(Spacer(1, 6))
 
     in_code = False
-    code_buf = []
-    table_buf = []
+    code_buf, table_buf = [], []
 
     def flush_code():
         if code_buf:
@@ -230,6 +233,8 @@ def _pdf_via_reportlab_from_md(md_text: str, title: str, font_name: str, font_pa
     except Exception as e:
         return None, f"ReportLab PDF 실패: {e}"
 
+# ---- Pillow 경로 (TTC 포함)
+
 def _pdf_via_pillow_text(text: str, title: str, font_path: str, ext: str):
     try:
         from PIL import Image, ImageDraw, ImageFont
@@ -266,7 +271,6 @@ def _pdf_via_pillow_text(text: str, title: str, font_path: str, ext: str):
         lines, cur = [], ""
         for w in words:
             test = (cur + " " + w).strip() if cur else w
-        # 긴 단어 처리
             if draw.textlength(test, font=f) <= MAX_W:
                 cur = test
             else:
@@ -287,8 +291,7 @@ def _pdf_via_pillow_text(text: str, title: str, font_path: str, ext: str):
 
     blocks = []
     if title: blocks.append(("__TITLE__", title))
-    # 빈 줄 기준 문단 분리
-    for p in text.replace("\r\n","\n").split("\n\n"):
+    for p in (text or "").replace("\r\n","\n").split("\n\n"):
         if p: blocks.append(("P", p))
 
     pages = []
@@ -296,7 +299,7 @@ def _pdf_via_pillow_text(text: str, title: str, font_path: str, ext: str):
     draw = ImageDraw.Draw(img)
     y = T
 
-    if blocks and blocks[0][0] == "__TITLE__":  # 제목
+    if blocks and blocks[0][0] == "__TITLE__":
         for ln in wrap(draw, blocks[0][1], title_font):
             draw.text((L, y), ln, font=title_font, fill=0); y += title_font.size + line_gap
         y += 10; blocks = blocks[1:]
@@ -325,6 +328,7 @@ def _pdf_via_pillow_text(text: str, title: str, font_path: str, ext: str):
     except Exception as e:
         return None, f"Pillow PDF 저장 실패: {e}"
 
+
 def markdown_to_pdf_korean(md_text: str, title: str|None=None):
     cands = _resolve_korean_font_candidates()
     if not cands:
@@ -335,8 +339,8 @@ def markdown_to_pdf_korean(md_text: str, title: str|None=None):
         return pdf, dbg
     return _pdf_via_pillow_text(md_text or "", title or "", path, ext)
 
+
 def text_to_pdf_bytes_korean(text: str, title: str|None=None):
-    # 텍스트를 단순 PDF로 (ReportLab 마크다운 경로 우선, 실패 시 Pillow 경로)
     return markdown_to_pdf_korean(text, title=title)
 
 # =========================
@@ -355,10 +359,9 @@ def extract_text_from_pdf(file_bytes: bytes) -> str:
     except Exception as e:
         return f"[PDF 추출 실패] {e}"
 
+
 def extract_text_from_hwpx_bytes(hwpx_bytes: bytes) -> str:
-    """
-    HWPX는 ZIP 컨테이너. /Contents/section*.xml 내 텍스트를 추출.
-    """
+    """HWPX(ZIP) → section XML에서 텍스트 추출"""
     try:
         import xml.etree.ElementTree as ET
     except Exception as e:
@@ -367,7 +370,6 @@ def extract_text_from_hwpx_bytes(hwpx_bytes: bytes) -> str:
     try:
         buf = BytesIO(hwpx_bytes)
         with zipfile.ZipFile(buf, 'r') as zf:
-            # 대표 본문 섹션 파일들
             section_files = [n for n in zf.namelist() if n.startswith("Contents/") and n.lower().endswith(".xml")]
             section_files.sort()
             out_lines = []
@@ -375,7 +377,6 @@ def extract_text_from_hwpx_bytes(hwpx_bytes: bytes) -> str:
                 try:
                     xml_data = zf.read(name)
                     root = ET.fromstring(xml_data)
-                    # 텍스트 노드(hwp:run/hwp:t 등) 추출 — 네임스페이스 고려(간단 패턴)
                     text_parts = []
                     for elem in root.iter():
                         tag = elem.tag
@@ -391,93 +392,12 @@ def extract_text_from_hwpx_bytes(hwpx_bytes: bytes) -> str:
         return f"[HWPX ZIP 열기 실패] {e}"
 
 # =========================
-# HWP 변환 파이프라인 (핵심)
+# HWP 변환 파이프라인 (우선순위: hwp5txt → unoconv)
 # =========================
 
-def _run_hwp2hwpx_to_bytes(file_bytes: bytes, filename: str):
-    """
-    1순위: hwp2hwpx (JAR 우선, 없으면 바이너리)
-    """
-    # 임시 저장
-    in_fd, in_path = tempfile.mkstemp(suffix=".hwp"); os.close(in_fd)
-    with open(in_path, "wb") as f:
-        f.write(file_bytes)
-
-    # JAR 우선
-    jar_candidates = [
-        os.path.join(os.getcwd(), "tools", "hwp2hwpx.jar"),
-        "/usr/local/bin/hwp2hwpx.jar",
-        "/usr/share/hwp2hwpx/hwp2hwpx.jar",
-        "/app/hwp2hwpx.jar",
-    ]
-    jar_path = next((p for p in jar_candidates if os.path.exists(p)), None)
-    java = _which("java") or "/usr/bin/java"
-
-    if jar_path and (java and os.path.exists(java)):
-        out_path = in_path + ".hwpx"
-        try:
-            cp = subprocess.run([java, "-jar", jar_path, in_path, out_path],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-            if cp.returncode == 0 and os.path.exists(out_path):
-                with open(out_path, "rb") as rf:
-                    hwpx = rf.read()
-                try: os.remove(in_path)
-                except Exception: pass
-                try: os.remove(out_path)
-                except Exception: pass
-                return hwpx, "OK[hwp2hwpx-jar]"
-            dbg = f"hwp2hwpx-jar 실패: {cp.stderr.decode(errors='ignore')[:200]}"
-        except subprocess.TimeoutExpired:
-            dbg = "hwp2hwpx-jar 타임아웃"
-        except Exception as e:
-            dbg = f"hwp2hwpx-jar 오류: {e}"
-        finally:
-            try: os.remove(out_path)
-            except Exception: pass
-            try: os.remove(in_path)
-            except Exception: pass
-        return None, dbg
-
-    # 바이너리
-    bin_path = _which("hwp2hwpx") or _which("hwp2hwpx-cli")
-    if bin_path:
-        out_dir = tempfile.mkdtemp()
-        try:
-            cp = subprocess.run([bin_path, in_path, "-o", out_dir],
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
-            if cp.returncode == 0:
-                for fn in os.listdir(out_dir):
-                    if fn.lower().endswith(".hwpx"):
-                        with open(os.path.join(out_dir, fn), "rb") as rf:
-                            hwpx = rf.read()
-                        try: shutil.rmtree(out_dir, ignore_errors=True)
-                        except Exception: pass
-                        try: os.remove(in_path)
-                        except Exception: pass
-                        return hwpx, "OK[hwp2hwpx-bin]"
-                dbg = "hwp2hwpx-bin 실행 OK, HWPX 결과 없음"
-            else:
-                dbg = f"hwp2hwpx-bin 실패: {cp.stderr.decode(errors='ignore')[:200]}"
-        except subprocess.TimeoutExpired:
-            dbg = "hwp2hwpx-bin 타임아웃"
-        except Exception as e:
-            dbg = f"hwp2hwpx-bin 오류: {e}"
-        finally:
-            try: shutil.rmtree(out_dir, ignore_errors=True)
-            except Exception: pass
-            try: os.remove(in_path)
-            except Exception: pass
-        return None, dbg
-
-    # 둘 다 없음
-    try: os.remove(in_path)
-    except Exception: pass
-    return None, "hwp2hwpx 미탑재"
+# --- 1) hwp5txt: .hwp → 텍스트
 
 def _run_hwp5txt_to_text(file_bytes: bytes, filename: str):
-    """
-    2순위: hwp5txt → TXT
-    """
     tool = _which("hwp5txt")
     if not tool:
         return "", "hwp5txt 미설치"
@@ -501,38 +421,77 @@ def _run_hwp5txt_to_text(file_bytes: bytes, filename: str):
         try: os.remove(in_path)
         except Exception: pass
 
+# --- 2) unoconv/soffice: .hwp → PDF → 텍스트
+
+
+def _run_unoconv_hwp_to_pdf_bytes(file_bytes: bytes, filename: str):
+    unoconv_bin = _which("unoconv")
+    soffice_bin = _which("soffice") or _which("libreoffice")
+    in_fd, in_path = tempfile.mkstemp(suffix=".hwp"); os.close(in_fd)
+    with open(in_path, "wb") as f:
+        f.write(file_bytes)
+
+    out_dir = tempfile.mkdtemp()
+    out_pdf = os.path.join(out_dir, os.path.splitext(os.path.basename(filename))[0] + ".pdf")
+
+    try:
+        if unoconv_bin:
+            cp = subprocess.run([unoconv_bin, '-f', 'pdf', '-o', out_dir, in_path],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+            if cp.returncode != 0:
+                raise RuntimeError(f"unoconv 실패: {cp.stderr.decode(errors='ignore')[:200]}")
+        elif soffice_bin:
+            cp = subprocess.run([soffice_bin, '--headless', '--convert-to', 'pdf', '--outdir', out_dir, in_path],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        else:
+            raise FileNotFoundError("unoconv/soffice 미설치")
+
+        if not os.path.exists(out_pdf):
+            cand = next((os.path.join(out_dir, fn) for fn in os.listdir(out_dir) if fn.lower().endswith('.pdf')), None)
+            if not cand:
+                raise FileNotFoundError("PDF 결과 파일을 찾지 못함 (LibreOffice에서 HWP 미지원일 수 있음)")
+            out_pdf = cand
+
+        with open(out_pdf, 'rb') as rf:
+            pdf_bytes = rf.read()
+        return pdf_bytes, "OK[unoconv/soffice→PDF]"
+    finally:
+        try: os.remove(in_path)
+        except Exception: pass
+        try: shutil.rmtree(out_dir, ignore_errors=True)
+        except Exception: pass
+
+
 def _convert_hwp_priority(file_bytes: bytes, filename: str):
     """
-    1) hwp2hwpx → HWPX(XML 파싱)
-    2) 실패 시 hwp5txt → TXT
-    3) 텍스트를 PDF로 재조합(ReportLab/Pillow)
+    1) hwp5txt → TXT 직접 추출 (우선)
+    2) unoconv/soffice → PDF 변환 후 PyPDF2 텍스트 추출 (폴백)
     """
-    # 1) HWPX
-    hwpx_bytes, dbg1 = _run_hwp2hwpx_to_bytes(file_bytes, filename)
-    if hwpx_bytes:
-        try:
-            text = extract_text_from_hwpx_bytes(hwpx_bytes)
-        except Exception as e:
-            text = f"[HWPX 파싱 실패] {e}"
-        pdf_bytes, dbg_pdf = text_to_pdf_bytes_korean(text, title=os.path.basename(filename) + " (HWPX 추출)")
-        gen_pdf = (os.path.splitext(os.path.basename(filename))[0] + "_hwpx_extract.pdf", pdf_bytes) if pdf_bytes else None
-        return text, gen_pdf, f"{dbg1} → XML파싱 → {dbg_pdf}"
+    # 1) hwp5txt
+    txt1, dbg1 = _run_hwp5txt_to_text(file_bytes, filename)
+    if txt1:
+        pdf_bytes1, dbg_pdf1 = text_to_pdf_bytes_korean(txt1, title=os.path.basename(filename) + " (hwp5txt 추출)")
+        gen_pdf1 = (os.path.splitext(os.path.basename(filename))[0] + "_txt_extract.pdf", pdf_bytes1) if pdf_bytes1 else None
+        return txt1, gen_pdf1, f"{dbg1} → {dbg_pdf1}"
 
-    # 2) hwp5txt
-    txt, dbg2 = _run_hwp5txt_to_text(file_bytes, filename)
-    if txt:
-        pdf_bytes, dbg_pdf = text_to_pdf_bytes_korean(txt, title=os.path.basename(filename) + " (hwp5txt 추출)")
-        gen_pdf = (os.path.splitext(os.path.basename(filename))[0] + "_txt_extract.pdf", pdf_bytes) if pdf_bytes else None
-        return txt, gen_pdf, f"{dbg2} → {dbg_pdf}"
+    # 2) unoconv/soffice
+    try:
+        pdf_bytes2, dbg2 = _run_unoconv_hwp_to_pdf_bytes(file_bytes, filename)
+        if pdf_bytes2:
+            txt2 = extract_text_from_pdf(pdf_bytes2)
+            gen_pdf2 = (os.path.splitext(os.path.basename(filename))[0] + "_converted.pdf", pdf_bytes2)
+            return txt2, gen_pdf2, f"{dbg2} → PDF텍스트 추출"
+    except Exception as e:
+        dbg2 = f"unoconv/soffice 실패: {e}"
 
-    # 3) 실패
-    return "", None, f"hwp2hwpx 실패 · {dbg1} / hwp5txt 실패 · {dbg2}"
+    return "", None, f"hwp5txt 실패 · {dbg1} / {dbg2 if 'dbg2' in locals() else 'unoconv 미시도'}"
 
 # =========================
 # 업로드 소스 처리 (HWP 파이프라인 통합)
 # =========================
 
 DOC_EXTS = {".doc",".docx",".hwp",".hwpx",".xls",".xlsx",".pdf",".txt",".md",".csv",".log"}
+
 
 def handle_uploaded_source_files(uploaded_files):
     combined_texts, convert_logs, generated_pdfs = [], [], []
@@ -585,18 +544,19 @@ def handle_uploaded_source_files(uploaded_files):
 
 
 # -*- coding: utf-8 -*-
-# app_part2.py — UI, 차트, 첨부 매트릭스, 로그인, GPT 래퍼
-# app_part1.py 의 함수/상수들을 import 했다고 가정합니다.
-# 한 파일로 쓰실 경우, 이 파일의 코드만 app_part1 아래에 그대로 이어붙이세요.
+# =============================================================
+# app_part2.py — UI, 차트, 첨부 매트릭스, 로그인, GPT 래퍼 (1/2)
+# (이 파일은 app_part1.py 아래에 그대로 이어붙여 한 파일로 사용 가능합니다)
+# =============================================================
 
-import os
-import re
-from io import BytesIO
-from datetime import datetime
+import os as _os
+import re as _re
+from io import BytesIO as _BytesIO
+from datetime import datetime as _dt
 
 import streamlit as st
-import pandas as pd
-import numpy as np
+import pandas as _pd
+import numpy as _np
 import plotly.express as px
 
 # ----- 여기서부터 app_part1.py 내 심볼을 사용합니다 -----
@@ -615,8 +575,8 @@ def call_gpt_with_fallback(messages, temperature=0.3, max_tokens=2000, model="gp
         raise Exception("openai 미설치: pip install openai")
 
     keys = []
-    if os.environ.get("OPENAI_API_KEY"):
-        keys.append(os.environ["OPENAI_API_KEY"])
+    if _os.environ.get("OPENAI_API_KEY"):
+        keys.append(_os.environ["OPENAI_API_KEY"])
     keys.extend([k for k in API_KEYS if k and not str(k).startswith("sk-REPLACE_")])
 
     if not keys:
@@ -662,8 +622,9 @@ VENDOR_COLOR_MAP = {
 }
 OTHER_SEQ = ["#2E8B57","#6B8E23","#556B2F","#8B4513","#A0522D","#CD853F","#228B22","#006400"]
 
+
 def normalize_vendor(name: str) -> str:
-    s = str(name) if pd.notna(name) else ""
+    s = str(name) if _pd.notna(name) else ""
     if "엘지유플러스" in s or "LG유플러스" in s or "LG U" in s.upper():
         return "엘지유플러스"
     if s.startswith("케이티") or " KT" in s or s == "KT" or "주식회사 케이티" in s:
@@ -678,9 +639,9 @@ def normalize_vendor(name: str) -> str:
 # 첨부 링크 매트릭스
 # =========================
 
-def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFrame:
+def build_attachment_matrix(df_like: _pd.DataFrame, title_col: str) -> _pd.DataFrame:
     if title_col not in df_like.columns:
-        return pd.DataFrame(columns=[title_col,"본공고링크","제안요청서","공고서","과업지시서","규격서","기타"])
+        return _pd.DataFrame(columns=[title_col,"본공고링크","제안요청서","공고서","과업지시서","규격서","기타"])
     buckets = {}
     def add_link(title, category, name, url):
         if title not in buckets:
@@ -690,7 +651,7 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
 
     n_cols = df_like.shape[1]
     for _, row in df_like.iterrows():
-        title = str(row.get(title_col,"")).strip()
+        title = str(row.get(title_col, "")).strip()
         if not title:
             continue
         for j in range(1, n_cols):
@@ -698,7 +659,7 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
             name_col = df_like.columns[j-1]
             url_val = row.get(url_col, None)
             name_val = row.get(name_col, None)
-            if pd.isna(url_val):
+            if _pd.isna(url_val):
                 continue
             raw = str(url_val).strip()
             if _is_url(raw):
@@ -708,7 +669,7 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
                 urls = [u for u in toks if _is_url(u)]
                 if not urls:
                     continue
-            name_base = "" if pd.isna(name_val) else str(name_val).strip()
+            name_base = "" if _pd.isna(name_val) else str(name_val).strip()
             name_tokens = [n.strip() for n in name_base.replace("\n",";").split(";")] if name_base else []
             for k, u in enumerate(urls):
                 disp_name = name_tokens[k] if k < len(name_tokens) and name_tokens[k] else (name_base or _filename_from_url(u))
@@ -741,11 +702,12 @@ def build_attachment_matrix(df_like: pd.DataFrame, title_col: str) -> pd.DataFra
             "규격서": join_html(catmap["규격서"]),
             "기타": join_html(catmap["기타"]),
         })
-    out_df = pd.DataFrame(rows)
+    out_df = _pd.DataFrame(rows)
     out_df = out_df.sort_values(by=[title_col]).reset_index(drop=True)
     return out_df
 
-def render_attachment_table_html(df_links: pd.DataFrame, title_col: str,
+
+def render_attachment_table_html(df_links: _pd.DataFrame, title_col: str,
                                  min_title_px: int = 360, wide_link_px: int = 440, narrow_px: int = 280) -> str:
     cols = [title_col,"본공고링크","제안요청서","공고서","과업지시서","규격서","기타"]
     present_cols = [c for c in cols if c in df_links.columns]
@@ -755,7 +717,7 @@ def render_attachment_table_html(df_links: pd.DataFrame, title_col: str,
         else: return f'<th class="col-narrow">{c}</th>'
     def _td(c, v):
         cls = "col-title" if c == title_col else ("col-linkwide" if c in ["본공고링크","제안요청서","공고서"] else "col-narrow")
-        val = "" if pd.isna(v) else str(v)
+        val = "" if _pd.isna(v) else str(v)
         return f'<td class="{cls}">{val}</td>'
     html = []
     html.append(f"""
@@ -783,7 +745,8 @@ def render_attachment_table_html(df_links: pd.DataFrame, title_col: str,
     html.append("</tbody></table>")
     return "\n".join(html)
 
-def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
+
+def render_attachment_cards_html(df_links: _pd.DataFrame, title_col: str) -> str:
     cat_cols = ["본공고링크","제안요청서","공고서","과업지시서","규격서","기타"]
     present_cols = [c for c in cat_cols if c in df_links.columns]
     if title_col not in df_links.columns:
@@ -835,13 +798,13 @@ def render_attachment_cards_html(df_links: pd.DataFrame, title_col: str) -> str:
 # 차트 렌더
 # =========================
 
-def render_basic_analysis_charts(base_df: pd.DataFrame):
+def render_basic_analysis_charts(base_df: _pd.DataFrame):
     def pick_unit(max_val: float):
         if max_val >= 1_0000_0000_0000: return ("조원", 1_0000_0000_0000)
         elif max_val >= 100_000_000: return ("억원", 100_000_000)
         elif max_val >= 1_000_000: return ("백만원", 1_000_000)
         else: return ("원", 1)
-    def apply_unit(values: pd.Series, mode: str = "자동"):
+    def apply_unit(values: _pd.Series, mode: str = "자동"):
         unit_map = {"원":("원",1),"백만원":("백만원",1_000_000),"억원":("억원",100_000_000),"조원":("조원",1_0000_0000_0000)}
         if mode == "자동":
             u, f = pick_unit(values.max() if len(values) else 0); return values / f, u
@@ -860,7 +823,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
 
     for col in ["투찰금액","배정예산금액","투찰율"]:
         if col in dwin.columns:
-            dwin[col] = pd.to_numeric(dwin[col], errors="coerce")
+            dwin[col] = _pd.to_numeric(dwin[col], errors="coerce")
 
     if "대표업체" in dwin.columns:
         dwin["대표업체_표시"] = dwin["대표업체"].map(normalize_vendor)
@@ -900,7 +863,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
     col_scatter, col_bar3 = st.columns(2)
     with col_scatter:
         if "투찰율" in dwin.columns:
-            dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
+            dwin["공고게시일자_date"] = _pd.to_datetime(dwin.get("공고게시일자_date", _pd.NaT), errors="coerce")
             dplot = dwin.dropna(subset=["투찰율", "공고게시일자_date"]).copy()
             dplot = dplot[dplot["투찰율"] <= 300]
             hover_cols = [c for c in ["대표업체_표시","수요기관명","공고명","입찰공고명","입찰공고번호"] if c in dplot.columns]
@@ -914,7 +877,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
     with col_bar3:
         if "투찰금액" in dwin.columns:
             dyear = dwin.copy()
-            dyear["연도"] = pd.to_datetime(dyear.get("공고게시일자_date", pd.NaT), errors="coerce").dt.year
+            dyear["연도"] = _pd.to_datetime(dyear.get("공고게시일자_date", _pd.NaT), errors="coerce").dt.year
             dyear = dyear.dropna(subset=["연도"])
             by_vendor_year = dyear.groupby(["연도","대표업체_표시"])["투찰금액"].sum().reset_index()
             fig_vy = px.bar(by_vendor_year, x="연도", y="투찰금액", color="대표업체_표시",
@@ -933,7 +896,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             st.info("배정예산금액 컬럼 없음 - 막대그래프 생략")
         return
 
-    dwin["공고게시일자_date"] = pd.to_datetime(dwin.get("공고게시일자_date", pd.NaT), errors="coerce")
+    dwin["공고게시일자_date"] = _pd.to_datetime(dwin.get("공고게시일자_date", _pd.NaT), errors="coerce")
     g = dwin.dropna(subset=["공고게시일자_date"]).copy()
     if g.empty:
         with col_stack: st.info("유효한 날짜가 없어 그래프를 표시할 수 없습니다.")
@@ -943,7 +906,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
     g["분기"] = g["공고게시일자_date"].dt.quarter
     g["연도분기"] = g["연도"].astype(str) + " Q" + g["분기"].astype(str)
     if "대표업체_표시" not in g.columns:
-        g["대표업체_표시"] = g.get("대표업체", pd.Series([""]*len(g))).map(normalize_vendor)
+        g["대표업체_표시"] = g.get("대표업체", _pd.Series([""]*len(g))).map(normalize_vendor)
 
     title_col = "입찰공고명" if "입찰공고명" in g.columns else ("공고명" if "공고명" in g.columns else None)
     group_col = "대표업체_표시"
@@ -961,7 +924,7 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             if title_col:
                 title_map = (
                     g.groupby(["연도분기", group_col])[title_col]
-                    .apply(lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10]))
+                    .apply(lambda s: " | ".join(_pd.Series(s).dropna().astype(str).unique()[:10]))
                     .rename("입찰공고목록").reset_index()
                 )
                 grp = grp.merge(title_map, on=["연도분기", group_col], how="left")
@@ -973,9 +936,9 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
             grp["분"] = grp["연도분기"].str.extract(r"Q(\d)").astype(int)
             grp = grp.sort_values(["연","분",group_col]).reset_index(drop=True)
             ordered_quarters = grp.sort_values(["연","분"])["연도분기"].unique()
-            grp["연도분기"] = pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
+            grp["연도분기"] = _pd.Categorical(grp["연도분기"], categories=ordered_quarters, ordered=True)
 
-            custom = np.column_stack([grp[group_col].astype(str).to_numpy(),
+            custom = _np.column_stack([grp[group_col].astype(str).to_numpy(),
                                       grp["입찰공고목록"].astype(str).to_numpy()])
 
             fig_stack = px.bar(
@@ -1006,11 +969,11 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         grp_total = grp_total.sort_values(["연","분"])
         if title_col:
             titles_total = g.groupby("연도분기")[title_col].apply(
-                lambda s: " | ".join(pd.Series(s).dropna().astype(str).unique()[:10])
+                lambda s: " | ".join(_pd.Series(s).dropna().astype(str).unique()[:10])
             ).reindex(grp_total["연도분기"]).fillna("")
-            custom2 = np.stack([titles_total], axis=-1)
+            custom2 = _np.stack([titles_total], axis=-1)
         else:
-            custom2 = np.stack([pd.Series([""])], axis=-1)
+            custom2 = _np.stack([_pd.Series([""])], axis=-1)
         fig_bar = px.bar(grp_total, x="연도분기", y="금액합", title="연·분기별 배정예산금액 (총합)", text="금액합")
         fig_bar.update_traces(
             customdata=custom2,
@@ -1019,13 +982,28 @@ def render_basic_analysis_charts(base_df: pd.DataFrame):
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
+# -*- coding: utf-8 -*-
+# =============================================================
+# app_part2.py — UI, 차트, 첨부 매트릭스, 로그인, GPT 래퍼 (2/2)
+# (이 파일은 app_part1.py 및 app_part2.py(1/2) 아래에 그대로 이어붙여 한 파일로 사용 가능합니다)
+# =============================================================
+
+import os as _os
+import re as _re
+from io import BytesIO as _BytesIO
+from datetime import datetime as _dt
+
+import streamlit as st
+import pandas as _pd
+import numpy as _np
+import plotly.express as px
+
 # =========================
 # 로그인 게이트
 # =========================
 
 def login_gate():
     import streamlit.components.v1 as components
-    # 최초 접근 경고 팝업
     components.html(
         """
         <script>
@@ -1054,6 +1032,7 @@ def login_gate():
     with col2:
         st.info("SK브로드밴드 사번 4자리와 생년월일 6자리를 입력하세요. 문의 : 8girim@sk.com")
 
+
 # =========================
 # 메인 앱
 # =========================
@@ -1079,7 +1058,7 @@ def main():
     menu = st.sidebar.radio("# 📋 메뉴 선택", ["조달입찰결과현황","내고객 분석하기"], disabled=not AUThed)
 
     # GPT 상태
-    _ok = bool(os.environ.get("OPENAI_API_KEY"))
+    _ok = bool(_os.environ.get("OPENAI_API_KEY"))
     st.sidebar.success("GPT 사용 가능" if _ok else "GPT 버튼 활성 (환경변수 필요)")
 
     gpt_extra_req = st.sidebar.text_area("🤖 GPT 추가 요구사항(선택)", height=120,
@@ -1096,7 +1075,7 @@ def main():
         st.stop()
 
     # 엑셀 로드
-    df = pd.read_excel(uploaded_file, sheet_name="filtered", engine="openpyxl")
+    df = _pd.read_excel(uploaded_file, sheet_name="filtered", engine="openpyxl")
     df_original = df.copy()
 
     # 필터
@@ -1121,9 +1100,9 @@ def main():
 
     st.sidebar.subheader("📆 공고게시일자 필터")
     if "공고게시일자_date" in df.columns:
-        df["공고게시일자_date"] = pd.to_datetime(df["공고게시일자_date"], errors="coerce")
+        df["공고게시일자_date"] = _pd.to_datetime(df["공고게시일자_date"], errors="coerce")
     else:
-        df["공고게시일자_date"] = pd.NaT
+        df["공고게시일자_date"] = _pd.NaT
     df["year"] = df["공고게시일자_date"].dt.year
     df["month"] = df["공고게시일자_date"].dt.month
     year_list = sorted([int(x) for x in df["year"].dropna().unique()])
@@ -1146,19 +1125,17 @@ def main():
     if menu == "조달입찰결과현황":
         st.title("📑 조달입찰결과현황")
 
-        dl_buf = BytesIO()
+        dl_buf = _BytesIO()
         df_filtered.to_excel(dl_buf, index=False, engine="openpyxl"); dl_buf.seek(0)
         st.download_button(
             label="📥 필터링된 데이터 다운로드 (Excel)",
             data=dl_buf,
-            file_name=f"filtered_result_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            file_name=f"filtered_result_{_dt.now().strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
         st.data_editor(df_filtered, use_container_width=True, key="result_editor", height=520)
 
-        with st.expanders("📊 기본 통계 분석(차트) 열기", expanded=False):
-            pass  # Streamlit Cloud 일부 환경에서 expanders 경합 이슈 회피용
         with st.expander("📊 기본 통계 분석(차트) 열기", expanded=False):
             render_basic_analysis_charts(df_filtered)
 
@@ -1189,12 +1166,12 @@ def main():
                 result = df_original[df_original[demand_col].isin(customers)]
                 st.subheader(f"📊 검색 결과: {len(result)}건")
                 if not result.empty:
-                    rb = BytesIO()
+                    rb = _BytesIO()
                     result.to_excel(rb, index=False, engine="openpyxl"); rb.seek(0)
                     st.download_button(
                         label="📥 결과 데이터 다운로드 (Excel)",
                         data=rb,
-                        file_name=f"{'_'.join(customers)}_이력_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+                        file_name=f"{'_'.join(customers)}_이력_{_dt.now().strftime('%Y%m%d_%H%M')}.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
 
@@ -1222,21 +1199,21 @@ def main():
                                 html = render_attachment_table_html(attach_df, title_col, 360, 440, 280)
                             st.markdown(html, unsafe_allow_html=True)
 
-                            xbuf = BytesIO()
-                            with pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
+                            xbuf = _BytesIO()
+                            with _pd.ExcelWriter(xbuf, engine="openpyxl") as writer:
                                 attach_df.to_excel(writer, index=False, sheet_name="attachments")
                             xbuf.seek(0)
                             st.download_button(
                                 label="📥 첨부 링크 매트릭스 다운로드 (Excel)",
                                 data=xbuf,
-                                file_name=f"{'_'.join(customers)}_첨부링크_매트릭스_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                                file_name=f"{'_'.join(customers)}_첨부링크_매트릭스_{_dt.now().strftime('%Y%m%d')}.xlsx",
                                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                             )
 
                     # ===== GPT 분석 =====
                     st.markdown("---")
                     st.subheader("🤖 GPT 분석 (업로드한 파일 기반)")
-                    st.caption("HWP 업로드 시 자동으로 **hwp2hwpx → XML 파싱**, 실패 시 **hwp5txt** 폴백 후 텍스트를 PDF로 재조합합니다.")
+                    st.caption("HWP 업로드 시 자동으로 **hwp5txt 우선 → 실패 시 unoconv(pdf) → PDF문자 추출** 순으로 처리합니다.")
                     src_files = st.file_uploader(
                         "분석할 파일 업로드 (여러 개 가능, PDF/HWP/HWPX/DOCX/TXT/CSV/MD/LOG 권장)",
                         type=["pdf","hwp","hwpx","docx","txt","csv","md","log"],
@@ -1248,7 +1225,7 @@ def main():
                         st.markdown("### 📝 GPT 분석 보고서 (세션 보존)")
                         st.markdown(st.session_state["gpt_report_md"])
 
-                        base_fname_prev = f"{'_'.join(customers) if customers else '세션'}_GPT분석_{datetime.now().strftime('%Y%m%d_%H%M')}"
+                        base_fname_prev = f"{'_'.join(customers) if customers else '세션'}_GPT분석_{_dt.now().strftime('%Y%m%d_%H%M')}"
                         md_bytes_prev = st.session_state["gpt_report_md"].encode("utf-8")
                         col_md_prev, col_pdf_prev = st.columns(2)
                         with col_md_prev:
@@ -1273,7 +1250,6 @@ def main():
                             else:
                                 st.error(f"PDF 생성 실패: {dbg_prev}")
 
-                        # 원문 변환본 다운로드
                         files = st.session_state.get("generated_src_pdfs") or []
                         if files:
                             st.markdown("### 🗂️ 변환된 간이 PDF 내려받기 (세션 보존)")
@@ -1324,11 +1300,10 @@ def main():
                                             st.markdown("### 📝 GPT 분석 보고서")
                                             st.markdown(report)
 
-                                            # 세션 저장
                                             st.session_state["gpt_report_md"] = report
                                             st.session_state["generated_src_pdfs"] = generated_pdfs
 
-                                            base_fname = f"{'_'.join(customers)}_GPT분석_{datetime.now().strftime('%Y%m%d_%H%M')}"
+                                            base_fname = f"{'_'.join(customers)}_GPT분석_{_dt.now().strftime('%Y%m%d_%H%M')}"
                                             md_bytes = report.encode("utf-8")
 
                                             col_md, col_pdf = st.columns(2)
@@ -1354,7 +1329,6 @@ def main():
                                                 else:
                                                     st.error(f"PDF 생성 실패: {dbg}")
 
-                                            # 변환된 간이 PDF들 다운로드
                                             if st.session_state["generated_src_pdfs"]:
                                                 st.markdown("---")
                                                 st.markdown("### 🗂️ 변환된 간이 PDF 내려받기")
@@ -1375,7 +1349,7 @@ def main():
                     if question:
                         st.session_state["chat_messages"].append({"role":"user","content":question})
                         ctx_df = result.head(200).copy()
-                        with pd.option_context('display.max_columns', None):
+                        with _pd.option_context('display.max_columns', None):
                             df_sample_csv = ctx_df.to_csv(index=False)[:20000]
                         report_ctx = st.session_state.get("gpt_report_md") or "(아직 보고서 없음)"
                         q_prompt = (
@@ -1409,5 +1383,20 @@ def main():
         else:
             st.info("고객사명을 입력하면 자동 필터링됩니다.")
 
+
 if __name__ == "__main__":
+    # 전역 설정 & 공용 유틸 (app_part1.py)
+    st.set_page_config(
+        page_title="조달입찰 분석 시스템",
+        layout="wide",
+        initial_sidebar_state="expanded",
+    )
+    st.markdown(
+        """
+        <meta name="robots" content="noindex,nofollow">
+        <meta name="googlebot" content="noindex,nofollow">
+        """,
+        unsafe_allow_html=True,
+    )
+
     main()
