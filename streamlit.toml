@@ -1,0 +1,13 @@
+[server]
+enableXsrfProtection = true
+enableCORS = false
+headless = true
+port = 8501
+
+[client]
+showErrorDetails = true
+toolbarMode = "viewer"
+
+[theme]
+base = "dark"          # "light" 원하시면 바꾸세요
+primaryColor = "#0d6efd"
