@@ -9,3 +9,4 @@ Pillow>=10.4
 openai>=1.50
 # 아래는 선택(문서 직접 파싱 안 쓰면 제거해도 됨)
 python-docx>=1.1
+olefile>=0.47
