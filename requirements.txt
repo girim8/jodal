@@ -1,11 +1,22 @@
-streamlit>=1.38.0
-pandas>=2.0.0,<3.0.0
-openpyxl>=3.1.0
-numpy>=1.24.0,<2.0.0
-plotly>=5.18.0
-PyPDF2>=3.0.0
-python-docx>=1.0.0
-reportlab>=4.0.0
-Pillow>=10.0.0
-openai>=1.0.0
-olefile>=0.47
+# --- Web UI & App Core ---
+streamlit==1.38.0
+
+# --- Data stack ---
+pandas==2.2.2
+numpy==1.26.4
+openpyxl==3.1.5
+xlsxwriter==3.2.0
+
+# --- Charts ---
+plotly==5.24.1
+
+# --- OpenAI ---
+openai==1.51.2
+
+# --- PDF / Image / Report ---
+PyPDF2==3.0.1
+reportlab==4.2.2
+Pillow==10.4.0
+
+# --- (선택) 문서 파서 보조: docx를 직접 열 일이 생기면 사용 ---
+# python-docx==1.1.2
