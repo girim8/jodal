@@ -3,8 +3,6 @@ libreoffice-writer
 default-jre
 fonts-nanum
 fonts-noto-cjk
-
-# HWP 텍스트 추출 (pyhwp/hwp5txt 체인)
 python3-pyhwp
 libgsf-bin
 libgsf-1-114
