@@ -626,6 +626,175 @@ import plotly.express as px
 import re
 
 # ===== 업로드 엑셀 로드 =====
+# --- HWP 우선전략(1순위: HWP→HWPX→XML, 2순위: LibreOffice PDF)용 유틸 추가 ---
+import os, tempfile, subprocess, zipfile
+
+# hwp2hwpx(네이티브 또는 jar) 우선 사용 → 실패 시 Part1의 convert_any_to_pdf(soffice 등)로 폴백
+
+def _which(cmd: str):
+    try:
+        import shutil as _sh
+        return _sh.which(cmd)
+    except Exception:
+        return None
+
+# 진단 표시: hwp2hwpx 경로
+try:
+    _hwp2hwpx_path = _which("hwp2hwpx") or _which("hwp2hwpx-cli") or (
+        os.path.exists("/usr/local/bin/hwp2hwpx") and "/usr/local/bin/hwp2hwpx" or None
+    )
+    _hwp2hwpx_jar = None
+    for cand in [
+        "/usr/local/bin/hwp2hwpx.jar",
+        "/usr/share/hwp2hwpx/hwp2hwpx.jar",
+        "/app/hwp2hwpx.jar",
+    ]:
+        if os.path.exists(cand):
+            _hwp2hwpx_jar = cand; break
+    st.sidebar.caption(f"hwp2hwpx: {_hwp2hwpx_path or ''}  jar: {_hwp2hwpx_jar or ''}")
+except Exception:
+    pass
+
+
+def _run_hwp2hwpx_to_bytes(file_bytes: bytes, filename: str):
+    """HWP 바이트를 HWPX 바이트로 변환 시도. (bytes, debug) 반환"""
+    # 1) 네이티브 바이너리 우선
+    if _hwp2hwpx_path:
+        in_fd, in_path = tempfile.mkstemp(suffix=".hwp"); os.close(in_fd)
+        out_dir = tempfile.mkdtemp()
+        try:
+            with open(in_path, "wb") as f: f.write(file_bytes)
+            cmd = [_hwp2hwpx_path, in_path, "-o", out_dir]
+            cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            if cp.returncode == 0:
+                for fn in os.listdir(out_dir):
+                    if fn.lower().endswith(".hwpx"):
+                        with open(os.path.join(out_dir, fn), "rb") as rf:
+                            return rf.read(), "OK[hwp2hwpx-bin]"
+                return None, "hwp2hwpx-bin 실행 OK, 그러나 HWPX 결과 없음"
+            else:
+                return None, f"hwp2hwpx-bin 실패: {cp.stderr.decode(errors='ignore')[:200]}"
+        except subprocess.TimeoutExpired:
+            return None, "hwp2hwpx-bin 타임아웃"
+        except Exception as e:
+            return None, f"hwp2hwpx-bin 오류: {e}"
+        finally:
+            try: os.remove(in_path)
+            except Exception: pass
+            try: import shutil as _sh; _sh.rmtree(out_dir, ignore_errors=True)
+            except Exception: pass
+    # 2) jar 실행 경로
+    if _hwp2hwpx_jar and (_which("java") or _which("/usr/bin/java")):
+        in_fd, in_path = tempfile.mkstemp(suffix=".hwp"); os.close(in_fd)
+        out_path = in_path + ".hwpx"
+        try:
+            with open(in_path, "wb") as f: f.write(file_bytes)
+            cmd = ["java", "-jar", _hwp2hwpx_jar, in_path, out_path]
+            cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+            if cp.returncode == 0 and os.path.exists(out_path):
+                with open(out_path, "rb") as rf:
+                    return rf.read(), "OK[hwp2hwpx-jar]"
+            return None, f"hwp2hwpx-jar 실패: {cp.stderr.decode(errors='ignore')[:200]}"
+        except subprocess.TimeoutExpired:
+            return None, "hwp2hwpx-jar 타임아웃"
+        except Exception as e:
+            return None, f"hwp2hwpx-jar 오류: {e}"
+        finally:
+            try: os.remove(in_path)
+            except Exception: pass
+            try: os.remove(out_path)
+            except Exception: pass
+    return None, "hwp2hwpx 미탑재 또는 실행 불가"
+
+
+def _convert_hwp_priority(file_bytes: bytes, filename: str):
+    """
+    1순위: hwp2hwpx로 HWP→HWPX 변환 후 XML 파싱
+    2순위: Part1의 convert_any_to_pdf(soffice→PDF) 경유
+    성공 시: (텍스트, (생성PDF파일명, 바이트), 로그문자열)
+    실패 시: ("", None, 로그문자열)
+    """
+    # 1) HWP→HWPX
+    hwpx_bytes, dbg1 = _run_hwp2hwpx_to_bytes(file_bytes, filename)
+    if hwpx_bytes:
+        # XML 파싱은 Part1의 extract_text_from_hwpx_bytes 재사용
+        try:
+            text = extract_text_from_hwpx_bytes(hwpx_bytes)
+        except Exception as e:
+            text = f"[HWPX 파싱 실패] {e}"
+        # 읽기용 간이 PDF 생성(ReportLab/Pillow) — 세션 저장용
+        pdf_bytes, dbg_pdf = text_to_pdf_bytes_korean(text, title=os.path.basename(filename)+" (HWPX 추출)")
+        gen_pdf = (os.path.splitext(os.path.basename(filename))[0] + "_hwpx_extract.pdf", pdf_bytes) if pdf_bytes else None
+        return text, gen_pdf, f"{dbg1} → XML파싱 → {dbg_pdf}"
+    # 2) soffice PDF 변환 폴백 (Part1 함수 사용)
+    try:
+        pdf_bytes, dbg2 = convert_any_to_pdf(file_bytes, filename)
+        if pdf_bytes:
+            # PDF에서 텍스트 추출
+            txt = extract_text_from_pdf_bytes(pdf_bytes)
+            gen_pdf = (os.path.splitext(os.path.basename(filename))[0] + ".pdf", pdf_bytes)
+            return txt, gen_pdf, f"폴백:{dbg2}"
+        else:
+            return "", None, f"hwp2hwpx 실패 및 soffice 폴백 실패: {dbg2}"
+    except Exception as e:
+        return "", None, f"폴백 변환 중 예외: {e}"
+
+# 기존 extract_text_combo를 덮어써서 .hwp 처리 우선순위 변경
+
+def extract_text_combo(uploaded_files):
+    combined_texts, convert_logs, generated_pdfs = [], [], []
+    for f in uploaded_files:
+        name = f.name; data = f.read(); ext = os.path.splitext(name)[1].lower()
+        if ext == ".hwp":
+            txt, gen_pdf, dbg = _convert_hwp_priority(data, name)
+            if txt:
+                if gen_pdf and gen_pdf[1]:
+                    generated_pdfs.append(gen_pdf)
+                convert_logs.append(f"✅ {name} → {dbg}, 텍스트 {len(txt)} chars")
+                combined_texts.append(f"
+
+===== [{name} → HWPX/XML or PDF] =====
+{txt}
+")
+            else:
+                convert_logs.append(f"🛑 {name}: {dbg}")
+        elif ext in [".pdf", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
+            # Part1의 경로 유지 (hwpx는 convert_any_to_pdf 내부에서 XML→텍스트 생성 경로 존재)
+            try:
+                pdf_bytes, dbg = convert_any_to_pdf(data, name)
+                if pdf_bytes:
+                    generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
+                    txt = extract_text_from_pdf_bytes(pdf_bytes)
+                    convert_logs.append(f"✅ {name} → PDF 변환 성공 ({dbg}), 텍스트 {len(txt)} chars")
+                    combined_texts.append(f"
+
+===== [{name} → PDF] =====
+{txt}
+")
+                else:
+                    convert_logs.append(f"🛑 {name}: PDF 변환 실패 ({dbg})")
+            except Exception as e:
+                convert_logs.append(f"🛑 {name}: 변환 중 예외 {e}")
+        elif ext in [".txt", ".csv", ".md", ".log"]:
+            for enc in ("utf-8-sig","utf-8","cp949","euc-kr"):
+                try:
+                    txt = data.decode(enc); break
+                except Exception:
+                    continue
+            else:
+                txt = data.decode("utf-8", errors="ignore")
+            convert_logs.append(f"🗒️ {name}: 텍스트 로드 완료")
+            combined_texts.append(f"
+
+===== [{name}] =====
+{txt}
+")
+        else:
+            convert_logs.append(f"ℹ️ {name}: 미지원 형식(원본 참조)")
+    return "
+".join(combined_texts).strip(), convert_logs, generated_pdfs
+
+# ===== 업로드 엑셀 로드 =====
 if not 'uploaded_file' in globals():
     uploaded_file = None
 
