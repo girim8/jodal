@@ -1,22 +1,2 @@
-# --- Web UI & App Core ---
-streamlit==1.38
-
-# --- Data stack ---
-pandas==2.2
-numpy==1.26
-openpyxl==3.1
-xlsxwriter==3.2
-
-# --- Charts ---
-plotly==5.2
-
-# --- OpenAI ---
-openai==1.5
-
-# --- PDF / Image / Report ---
-PyPDF2==3.0
-reportlab==4.2
-Pillow==10.4
-
-# --- (선택) 문서 파서 보조: docx를 직접 열 일이 생기면 사용 ---
-python-docx==1.1
+streamlit==1.39.0
+olefile==0.47
