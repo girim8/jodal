@@ -1,22 +1,26 @@
 # --- Web UI & App Core ---
-streamlit==1.38
+streamlit==1.39.0
 
 # --- Data stack ---
-pandas==2.2
-numpy==1.26
-openpyxl==3.1
-xlsxwriter==3.2
+pandas==2.2.3
+numpy==1.26.4
+openpyxl==3.1.5
+XlsxWriter==3.2.0
 
 # --- Charts ---
-plotly==5.2
+plotly==5.24.1
 
 # --- OpenAI ---
-openai==1.5
+# gpt-4.1/gpt-4.1-mini 지원 버전 범위 (메이저 2 미만 고정)
+openai>=1.47.0,<2
 
 # --- PDF / Image / Report ---
-PyPDF2==3.0
-reportlab==4.2
-Pillow==10.4
+PyPDF2==3.0.1
+reportlab==4.2.5
+Pillow==10.4.0
 
-# --- (선택) 문서 파서 보조: docx를 직접 열 일이 생기면 사용 ---
-python-docx==1.1
+# --- HWP parsing ---
+olefile==0.47
+
+# --- (선택) 문서 파서 보조: docx 직접 파싱이 필요할 때 ---
+python-docx==1.1.2
