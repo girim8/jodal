@@ -29,6 +29,8 @@ from urllib.parse import urlparse, unquote
 import plotly.express as px
 from textwrap import dedent
 
+from hwp_parser import convert_to_text
+
 # =====================================
 # 전역 메타(크롤링 제한)
 # =====================================
@@ -288,7 +290,18 @@ def extract_text_combo(uploaded_files):
         name = f.name
         data = f.read()
         ext = os.path.splitext(name)[1].lower()
-        if ext in [".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
+        if ext in [".hwp", ".hwpx"]:
+            try:
+                txt, fmt = convert_to_text(data, name)
+                combined_texts.append(f"\n\n===== [{name} ({fmt})] =====\n{_redact_secrets(txt)}\n")
+                convert_logs.append(f"✅ {name}: {fmt} 텍스트 추출 성공 ({len(txt)} chars)")
+                pdf_bytes, dbg_pdf = text_to_pdf_bytes_korean(txt, title=os.path.basename(name))
+                if pdf_bytes:
+                    generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
+                    convert_logs.append(f"🗂️ {name}: 추출 텍스트를 PDF로 생성 ({dbg_pdf})")
+            except Exception as exc:
+                convert_logs.append(f"🛑 {name}: 텍스트 추출 실패 ({exc})")
+        elif ext in [".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
             pdf_bytes, dbg = convert_any_to_pdf(data, name)
             if pdf_bytes:
                 generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
@@ -943,6 +956,41 @@ elif menu == "내고객 분석하기":
                 if st.button("📊 기본 분석(차트) 생성", use_container_width=True):
                     with st.spinner("차트를 생성하는 중..."):
                         render_basic_analysis_charts(result)
+
+                # ===== 경량 HWP/HWPX → TXT 변환기 =====
+                st.markdown("---")
+                st.subheader("📄 HWP/HWPX → TXT 변환 (Streamlit Cloud 최적화)")
+                st.caption("BodyText만 직접 파싱하여 외부 API 없이 텍스트를 추출합니다.")
+                hwp_txt_file = st.file_uploader(
+                    "HWP/HWPX 파일 업로드 (TXT 추출)",
+                    type=["hwp", "hwpx"],
+                    key="hwp_txt_extractor",
+                )
+                if not hwp_txt_file:
+                    st.info(
+                        "The converter parses the BodyText section directly without external APIs, "
+                        "so it runs comfortably within Streamlit Cloud limits."
+                    )
+                else:
+                    file_bytes = hwp_txt_file.read()
+                    with st.spinner("텍스트 추출 중..."):
+                        try:
+                            extracted_text, detected_fmt = convert_to_text(file_bytes, hwp_txt_file.name)
+                        except Exception as exc:  # noqa: BLE001
+                            st.error("Conversion failed. This HWP variant might not be supported yet.")
+                            st.exception(exc)
+                            extracted_text = None
+                        else:
+                            st.success(f"Done! Detected {detected_fmt} document and extracted its text.")
+
+                    if extracted_text:
+                        st.text_area("Extracted text", extracted_text, height=360)
+                        st.download_button(
+                            label="Download TXT",
+                            data=extracted_text.encode("utf-8-sig"),
+                            file_name=hwp_txt_file.name.rsplit(".", 1)[0] + ".txt",
+                            mime="text/plain",
+                        )
 
                 # ===== GPT 분석 =====
                 st.markdown("---")
