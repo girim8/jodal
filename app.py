@@ -29,6 +29,8 @@ from urllib.parse import urlparse, unquote
 import plotly.express as px
 from textwrap import dedent
 
+from hwp_parser import convert_to_text
+
 # =====================================
 # 전역 메타(크롤링 제한)
 # =====================================
@@ -288,7 +290,18 @@ def extract_text_combo(uploaded_files):
         name = f.name
         data = f.read()
         ext = os.path.splitext(name)[1].lower()
-        if ext in [".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
+        if ext in [".hwp", ".hwpx"]:
+            try:
+                txt, fmt = convert_to_text(data, name)
+                combined_texts.append(f"\n\n===== [{name} ({fmt})] =====\n{_redact_secrets(txt)}\n")
+                convert_logs.append(f"✅ {name}: {fmt} 텍스트 추출 성공 ({len(txt)} chars)")
+                pdf_bytes, dbg_pdf = text_to_pdf_bytes_korean(txt, title=os.path.basename(name))
+                if pdf_bytes:
+                    generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
+                    convert_logs.append(f"🗂️ {name}: 추출 텍스트를 PDF로 생성 ({dbg_pdf})")
+            except Exception as exc:
+                convert_logs.append(f"🛑 {name}: 텍스트 추출 실패 ({exc})")
+        elif ext in [".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
             pdf_bytes, dbg = convert_any_to_pdf(data, name)
             if pdf_bytes:
                 generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))

@@ -18,5 +18,8 @@ PyPDF2==3.0
 reportlab==4.2
 Pillow==10.4
 
+# --- HWP parsing ---
+olefile==0.47
+
 # --- (선택) 문서 파서 보조: docx를 직접 열 일이 생기면 사용 ---
 python-docx==1.1
