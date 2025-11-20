@@ -29,6 +29,8 @@ from urllib.parse import urlparse, unquote
 import plotly.express as px
 from textwrap import dedent
 
+from hwp_parser import convert_to_text
+
 # =====================================
 # 전역 메타(크롤링 제한)
 # =====================================
@@ -74,27 +76,33 @@ def _redact_secrets(text: str) -> str:
 def _get_openai_client():
     try:
         from openai import OpenAI
-    except Exception:
+    except Exception as exc:  # noqa: F841
         return None, False, "openai 미설치 (requirements.txt에 openai 추가 필요)"
+
     key = (
-        st.secrets.get("OPENAI_API_KEY", None) or
-        st.session_state.get("OPENAI_API_KEY", None) or
-        os.environ.get("OPENAI_API_KEY", None)
+        st.secrets.get("OPENAI_API_KEY", None)
+        or st.session_state.get("OPENAI_API_KEY", None)
+        or os.environ.get("OPENAI_API_KEY", None)
     )
     if not key or str(key).strip().startswith("sk-REPLACE_"):
         return None, True, "API 키 미설정 (st.secrets 혹은 사이드바에 입력)"
+
     try:
         client = OpenAI(api_key=key)
         return client, True, "OK"
-    except Exception as e:
-        return None, True, f"클라이언트 생성 실패: {e}"
+    except Exception as exc:  # noqa: F841
+        return None, True, f"클라이언트 생성 실패: {exc}"
 
 
 def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
-    try:
-        from openai import OpenAI
-    except Exception:
-        raise Exception("openai 미설치: requirements.txt에 openai 추가")
+    """OpenAI v1 Responses API 래퍼 (chat.completions 제거)."""
+
+    client, enabled, status = _get_openai_client()
+    if not enabled:
+        raise Exception(f"GPT 비활성 — {status}")
+    if not client:
+        raise Exception(f"GPT 키 필요 — {status}")
+
     guardrail_system = {
         "role": "system",
         "content": dedent(
@@ -106,18 +114,40 @@ def call_gpt(messages, temperature=0.4, max_tokens=2000, model="gpt-4.1"):
             """
         ).strip(),
     }
+
     safe_messages = [guardrail_system]
     for m in messages:
-        safe_messages.append({"role": m["role"], "content": _redact_secrets(m.get("content", ""))})
-    client, enabled, status = _get_openai_client()
-    if not enabled:
-        raise Exception(f"GPT 비활성 — {status}")
-    if not client:
-        raise Exception(f"GPT 키 필요 — {status}")
-    resp = client.chat.completions.create(
-        model=model, messages=safe_messages, temperature=temperature, max_tokens=max_tokens
-    )
-    return resp.choices[0].message.content
+        safe_messages.append({"role": m.get("role", "user"), "content": _redact_secrets(m.get("content", ""))})
+
+    try:
+        resp = client.responses.create(
+            model=model,
+            input=[{"role": m.get("role", "user"), "content": m.get("content", "")} for m in safe_messages],
+            temperature=temperature,
+            max_output_tokens=max_tokens,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise Exception(f"Responses 호출 실패: {exc}")
+
+    try:
+        if getattr(resp, "output_text", None):
+            return resp.output_text
+    except Exception:
+        pass
+
+    try:
+        chunks = []
+        for output in getattr(resp, "outputs", []) or []:
+            for content in getattr(output, "content", []) or []:
+                txt = getattr(content, "text", None)
+                if txt:
+                    chunks.append(txt)
+        if chunks:
+            return "\n".join(chunks).strip()
+    except Exception:
+        pass
+
+    raise Exception("Responses 응답 파싱 실패 (output_text/outputs 비어있음)")
 
 # =====================================
 # 변환/추출 유틸 (HWP/HWPX → PDF → 텍스트)
@@ -288,7 +318,18 @@ def extract_text_combo(uploaded_files):
         name = f.name
         data = f.read()
         ext = os.path.splitext(name)[1].lower()
-        if ext in [".pdf", ".hwp", ".hwpx", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
+        if ext in [".hwp", ".hwpx"]:
+            try:
+                txt, fmt = convert_to_text(data, name)
+                combined_texts.append(f"\n\n===== [{name} ({fmt})] =====\n{_redact_secrets(txt)}\n")
+                convert_logs.append(f"✅ {name}: {fmt} 텍스트 추출 성공 ({len(txt)} chars)")
+                pdf_bytes, dbg_pdf = text_to_pdf_bytes_korean(txt, title=os.path.basename(name))
+                if pdf_bytes:
+                    generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
+                    convert_logs.append(f"🗂️ {name}: 추출 텍스트를 PDF로 생성 ({dbg_pdf})")
+            except Exception as exc:
+                convert_logs.append(f"🛑 {name}: 텍스트 추출 실패 ({exc})")
+        elif ext in [".pdf", ".doc", ".docx", ".ppt", ".pptx", ".xls", ".xlsx"]:
             pdf_bytes, dbg = convert_any_to_pdf(data, name)
             if pdf_bytes:
                 generated_pdfs.append((os.path.splitext(name)[0] + ".pdf", pdf_bytes))
@@ -943,6 +984,41 @@ elif menu == "내고객 분석하기":
                 if st.button("📊 기본 분석(차트) 생성", use_container_width=True):
                     with st.spinner("차트를 생성하는 중..."):
                         render_basic_analysis_charts(result)
+
+                # ===== 경량 HWP/HWPX → TXT 변환기 =====
+                st.markdown("---")
+                st.subheader("📄 HWP/HWPX → TXT 변환 (Streamlit Cloud 최적화)")
+                st.caption("BodyText만 직접 파싱하여 외부 API 없이 텍스트를 추출합니다.")
+                hwp_txt_file = st.file_uploader(
+                    "HWP/HWPX 파일 업로드 (TXT 추출)",
+                    type=["hwp", "hwpx"],
+                    key="hwp_txt_extractor",
+                )
+                if not hwp_txt_file:
+                    st.info(
+                        "The converter parses the BodyText section directly without external APIs, "
+                        "so it runs comfortably within Streamlit Cloud limits."
+                    )
+                else:
+                    file_bytes = hwp_txt_file.read()
+                    with st.spinner("텍스트 추출 중..."):
+                        try:
+                            extracted_text, detected_fmt = convert_to_text(file_bytes, hwp_txt_file.name)
+                        except Exception as exc:  # noqa: BLE001
+                            st.error("Conversion failed. This HWP variant might not be supported yet.")
+                            st.exception(exc)
+                            extracted_text = None
+                        else:
+                            st.success(f"Done! Detected {detected_fmt} document and extracted its text.")
+
+                    if extracted_text:
+                        st.text_area("Extracted text", extracted_text, height=360)
+                        st.download_button(
+                            label="Download TXT",
+                            data=extracted_text.encode("utf-8-sig"),
+                            file_name=hwp_txt_file.name.rsplit(".", 1)[0] + ".txt",
+                            mime="text/plain",
+                        )
 
                 # ===== GPT 분석 =====
                 st.markdown("---")
